@@ -68,6 +68,7 @@ class EntityRow:
     name: str
     pid: int | None
     image: str | None
+    command: str | None
     cpu_percent: float
     gpu_percent: float | None
     ram_sum_bytes: int

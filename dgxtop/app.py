@@ -52,6 +52,8 @@ def fmt_history_window(seconds: int) -> str:
 
 
 LOWER_BARS = " ▁▂▃▄"
+NAME_COLUMN_KEY = "name"
+NAME_COLUMN_MIN_WIDTH = 8
 
 
 def normalize_series(values: list[float | None], width: int) -> list[float]:
@@ -97,6 +99,26 @@ def render_metric_block(label: str, latest: float | None, values: list[float | N
     chart_width = max(8, width - len(prefix))
     top, bottom = render_two_line_chart(values, chart_width)
     return f"{prefix}{top}", f"{' ' * len(prefix)}{bottom}"
+
+
+def clamp_column_content_width(
+    total_width: int,
+    other_render_widths: list[int],
+    *,
+    cell_padding: int = 1,
+    min_content_width: int = NAME_COLUMN_MIN_WIDTH,
+) -> int:
+    remaining_render_width = total_width - sum(other_render_widths)
+    return max(min_content_width, remaining_render_width - (2 * cell_padding))
+
+
+def build_name_cell_text(row: EntityRow, *, include_command: bool = True) -> str:
+    pid_value = str(row.pid) if row.pid else "--"
+    pid = f"{pid_value:>6}"
+    parts = [pid, row.name]
+    if include_command and row.command:
+        parts.append(row.command)
+    return " | ".join(parts)
 
 
 class ConfirmActionScreen(ModalScreen[bool]):
@@ -249,15 +271,15 @@ class DgxTopApp(App):
         table.show_horizontal_scrollbar = False
         table.show_cursor = True
         table.show_header = True
-        table.add_column("Type", width=4)
-        table.add_column("Name / PID", width=20)
-        table.add_column("CPU%", width=5)
-        table.add_column("GPU%", width=5)
-        table.add_column("RAM SUM", width=7)
-        table.add_column("RAM RSS", width=7)
-        table.add_column("RAM CGRP", width=7)
-        table.add_column("GPU MEM", width=7)
-        table.add_column("Status", width=7)
+        table.add_column("T", width=1, key="type")
+        table.add_column("PID / Name", width=20, key=NAME_COLUMN_KEY)
+        table.add_column("CPU%", width=5, key="cpu")
+        table.add_column("GPU%", width=5, key="gpu")
+        table.add_column("RAM SUM", width=7, key="ram_sum")
+        table.add_column("RAM RSS", width=7, key="ram_rss")
+        table.add_column("RAM CGRP", width=7, key="ram_cgrp")
+        table.add_column("GPU MEM", width=7, key="gpu_mem")
+        table.add_column("Status", width=7, key="status")
 
         self.query_one("#footer", Static).update(
             "Keys: q quit  d detail  c cpu  g gpu  m ram-sum  v vram  x stopped  k kill  r restart  +/- zoom"
@@ -332,6 +354,7 @@ class DgxTopApp(App):
     def _refresh_table(self) -> None:
         assert self.snapshot is not None
         table = self.query_one("#rows", DataTable)
+        self._resize_name_column(table)
         rows = self._sorted_rows()
         existing_selection = self.selected_key
 
@@ -368,13 +391,30 @@ class DgxTopApp(App):
         table.move_cursor(row=target_index)
 
     def _name_cell(self, row: EntityRow) -> Text:
-        cell = Text()
-        pid = f"pid:{row.pid}" if row.pid else "pid:--"
-        title = f"{row.name} | {pid}"
-        if len(title) > 20:
-            title = f"{title[:17]}..."
-        cell.append(title)
+        cell = Text(no_wrap=True, overflow="ellipsis")
+        cell.append(build_name_cell_text(row, include_command=not self.details_visible))
         return cell
+
+    def _resize_name_column(self, table: DataTable) -> None:
+        if NAME_COLUMN_KEY not in table.columns:
+            return
+
+        other_render_widths = [
+            column.get_render_width(table)
+            for key, column in table.columns.items()
+            if key != NAME_COLUMN_KEY
+        ]
+        name_width = clamp_column_content_width(
+            table.size.width,
+            other_render_widths,
+            cell_padding=table.cell_padding,
+        )
+        name_column = table.columns[NAME_COLUMN_KEY]
+        if name_column.width == name_width:
+            return
+        name_column.width = name_width
+        table._require_update_dimensions = True
+        table.refresh()
 
     def _refresh_details(self) -> None:
         panel = self.query_one("#details", Static)
@@ -506,6 +546,14 @@ class DgxTopApp(App):
     def action_toggle_details(self) -> None:
         self.details_visible = not self.details_visible
         self._refresh_details()
+        if self.snapshot is not None:
+            self._refresh_table()
+
+    def on_resize(self) -> None:
+        if self.snapshot is None:
+            return
+        self._refresh_table()
+        self._refresh_trends()
 
     def action_toggle_stopped(self) -> None:
         self.show_stopped = not self.show_stopped
