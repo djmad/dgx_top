@@ -3,7 +3,7 @@
 ## Development Setup
 
 ```bash
-cd /home/djmad/Documents/dgx_top
+cd /path/to/dgx_top
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```

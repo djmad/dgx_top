@@ -20,6 +20,10 @@ class ProcessInfo:
     gpu_percent: float | None = None
     container_id: str | None = None
     status: str = ""
+    # History tracking for activity detection
+    prev_rss_bytes: int | None = None
+    prev_cpu_percent: float | None = None
+    last_update_time: float | None = None
 
     @property
     def ram_sum_bytes(self) -> int:

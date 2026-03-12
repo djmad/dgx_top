@@ -348,7 +348,7 @@ class DgxTopApp(App):
 
         rows = sorted(self.snapshot.rows, key=sort_value, reverse=self.sort_desc)
         if not self.show_stopped:
-            rows = [row for row in rows if row.status == "running" or row.kind == "host"]
+            rows = [row for row in rows if row.status in ("running", "run") or row.kind == "host"]
         return rows
 
     def _refresh_table(self) -> None:

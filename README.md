@@ -33,7 +33,7 @@ It combines:
 ### Local development
 
 ```bash
-cd /home/djmad/Documents/dgx_top
+cd /path/to/dgx_top
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
@@ -41,7 +41,7 @@ python3 -m venv .venv
 ### Package install
 
 ```bash
-cd /home/djmad/Documents/dgx_top
+cd /path/to/dgx_top
 python3 -m pip install .
 ```
 
@@ -50,7 +50,7 @@ python3 -m pip install .
 ### Run from source
 
 ```bash
-cd /home/djmad/Documents/dgx_top
+cd /path/to/dgx_top
 .venv/bin/python dgx_top.py
 ```
 

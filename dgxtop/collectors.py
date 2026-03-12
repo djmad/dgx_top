@@ -47,6 +47,7 @@ class DashboardCollector:
         self._gpu_handles = self._load_gpu_handles() if self._gpu_ready else []
         self._cgroup_cache: dict[str, Path | None] = {}
         self._proc_cpu_prev: dict[tuple[int, float], tuple[float, float]] = {}
+        self._proc_history: dict[int, dict[str, float | int]] = {}  # pid -> {rss, cpu, timestamp}
         self._prev_net = psutil.net_io_counters()
         self._prev_net_ts = time.time()
         self._last_pmon_ts = 0.0
@@ -114,7 +115,7 @@ class DashboardCollector:
         processes, host_processes = self._read_processes(now, gpu_state["process_memory"], gpu_state["process_percent"])
         containers = self._read_containers(processes, include_stopped)
 
-        rows = self._build_rows(containers, host_processes, gpu_state["util_percent"])
+        rows = self._build_rows(containers, host_processes, gpu_state["util_percent"], now)
         system = self._read_system(include_stopped, gpu_state, containers, now)
 
         return DashboardSnapshot(
@@ -167,6 +168,8 @@ class DashboardCollector:
                     container_processes[container_id].append(process)
                 elif self._is_relevant_host_process(process):
                     host_processes.append(process)
+                    # Update history for activity tracking
+                    self._update_process_history(process, now)
             except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
                 continue
 
@@ -192,6 +195,7 @@ class DashboardCollector:
                 status = container.status or container.attrs.get("State", {}).get("Status", "unknown")
                 if status != "running" and not include_stopped:
                     continue
+                status = self._shorten_docker_status(status)
 
                 attrs = container.attrs or {}
                 state = attrs.get("State", {})
@@ -229,6 +233,7 @@ class DashboardCollector:
         containers: dict[str, ContainerInfo],
         host_processes: list[ProcessInfo],
         system_gpu_percent: float | None,
+        now: float,
     ) -> list[EntityRow]:
         rows: list[EntityRow] = []
         total_gpu_memory = sum(container.gpu_memory_bytes for container in containers.values()) + sum(
@@ -271,6 +276,8 @@ class DashboardCollector:
                 and proc.gpu_memory_bytes / total_gpu_memory >= 0.85
             ):
                 gpu_percent = system_gpu_percent
+            # Derive status based on activity for host processes
+            status = self._derive_process_status(proc, now)
             rows.append(
                 EntityRow(
                     key=f"host:{proc.pid}",
@@ -285,7 +292,7 @@ class DashboardCollector:
                     ram_rss_bytes=proc.rss_bytes,
                     ram_cgroup_bytes=None,
                     gpu_memory_bytes=proc.gpu_memory_bytes,
-                    status=proc.status,
+                    status=status,
                 )
             )
 
@@ -652,3 +659,59 @@ class DashboardCollector:
             or process.cpu_percent >= HOST_PROCESS_THRESHOLD_CPU
             or process.rss_bytes >= HOST_PROCESS_THRESHOLD_BYTES
         )
+
+    def _derive_process_status(self, process: ProcessInfo, now: float) -> str:
+        """Derive status based on activity in 5-second window.
+
+        Returns:
+            "GPU" if gpu_percent > 0.01 or gpu_memory_bytes > 0
+            "CPU" if cpu_percent > 0.01 and not GPU-active
+            "RAM" if rss changed significantly in 5s window and not CPU/GPU-active
+            "idle" if no significant activity
+        """
+        # Check for GPU activity
+        gpu_percent = process.gpu_percent or 0.0
+        if gpu_percent > 0.01 or process.gpu_memory_bytes > 0:
+            return "GPU"
+
+        # Check for CPU activity
+        if process.cpu_percent > 0.01:
+            return "CPU"
+
+        # Check for memory activity (rss changed in 5-second window)
+        pid = process.pid
+        if pid in self._proc_history:
+            prev = self._proc_history[pid]
+            prev_rss = prev.get("rss", 0)
+            prev_time = prev.get("timestamp", 0)
+            time_diff = now - prev_time
+
+            if time_diff >= 5.0 and prev_rss > 0:
+                rss_diff = abs(process.rss_bytes - prev_rss)
+                # Consider it active if rss changed by more than 1MB or 10%
+                if rss_diff > 1024 * 1024 or (prev_rss > 0 and rss_diff / prev_rss > 0.1):
+                    return "RAM"
+
+        return "idle"
+
+    def _update_process_history(self, process: ProcessInfo, now: float) -> None:
+        """Update the process history cache for activity tracking."""
+        self._proc_history[process.pid] = {
+            "rss": process.rss_bytes,
+            "cpu": process.cpu_percent,
+            "timestamp": now,
+        }
+
+    def _shorten_docker_status(self, status: str) -> str:
+        """Shorten Docker status values to fit in 7-char column."""
+        mapping = {
+            "running": "run",
+            "exited": "exit",
+            "paused": "pause",
+            "restarting": "rest",
+            "dead": "dead",
+            "created": "creat",
+            "removed": "rmov",
+            "unknown": "unkn",
+        }
+        return mapping.get(status, status[:7])
