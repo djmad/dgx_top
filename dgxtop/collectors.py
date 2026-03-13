@@ -4,8 +4,10 @@ import datetime as dt
 import glob
 import os
 import re
+import shutil
 import signal
 import subprocess
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -41,17 +43,163 @@ HOST_PROCESS_THRESHOLD_CPU = 0.5
 HISTORY_WINDOW_MIN = 60
 HISTORY_WINDOW_MAX = 24 * 60 * 60
 
+BPFTRACE_INTERVAL_SECONDS = 2.0
+
+
+class EbpfProcessTrafficCollector:
+    TX_BEGIN = "DGXTOP_TX_BEGIN"
+    TX_END = "DGXTOP_TX_END"
+    RX_BEGIN = "DGXTOP_RX_BEGIN"
+    RX_END = "DGXTOP_RX_END"
+    MAP_LINE_RE = re.compile(r"^@(tx|rx)\[(\d+)\]:\s+(\d+)$")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._process: subprocess.Popen[str] | None = None
+        self._thread: threading.Thread | None = None
+        self._rates: dict[int, tuple[float, float]] = {}
+        self._error: str | None = None
+        self._tx_snapshot: dict[int, int] = {}
+        self._rx_snapshot: dict[int, int] = {}
+
+        if shutil.which("bpftrace") is None:
+            self._error = "bpftrace not found"
+            return
+        if os.geteuid() != 0:
+            self._error = "bpftrace requires root"
+            return
+        self._start()
+
+    @property
+    def available(self) -> bool:
+        return self._process is not None and self._process.poll() is None
+
+    @property
+    def error(self) -> str | None:
+        return self._error
+
+    def shutdown(self) -> None:
+        process = self._process
+        self._process = None
+        if process is None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=1.0)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+    def get_rates(self) -> dict[int, tuple[float, float]]:
+        with self._lock:
+            return dict(self._rates)
+
+    def _start(self) -> None:
+        try:
+            self._process = subprocess.Popen(
+                ["bpftrace", "-B", "none", "-q", "-e", self._program()],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as error:
+            self._process = None
+            self._error = str(error)
+            return
+
+        assert self._process.stdout is not None
+        self._thread = threading.Thread(target=self._read_output, args=(self._process.stdout,), daemon=True)
+        self._thread.start()
+
+    def _program(self) -> str:
+        return f"""
+kfunc:tcp_sendmsg {{ @tx[pid] = sum(args.size); }}
+kfunc:udp_sendmsg {{ @tx[pid] = sum(args.len); }}
+kfunc:udpv6_sendmsg {{ @tx[pid] = sum(args.len); }}
+kretfunc:tcp_recvmsg /retval > 0/ {{ @rx[pid] = sum(retval); }}
+kretfunc:udp_recvmsg /retval > 0/ {{ @rx[pid] = sum(retval); }}
+kretfunc:udpv6_recvmsg /retval > 0/ {{ @rx[pid] = sum(retval); }}
+interval:s:{int(BPFTRACE_INTERVAL_SECONDS)} {{
+  printf("{self.TX_BEGIN}\\n");
+  print(@tx);
+  printf("{self.TX_END}\\n");
+  printf("{self.RX_BEGIN}\\n");
+  print(@rx);
+  printf("{self.RX_END}\\n");
+  clear(@tx);
+  clear(@rx);
+}}
+"""
+
+    def _read_output(self, stream) -> None:
+        current_map: str | None = None
+        current_values: dict[int, int] = {}
+        try:
+            for raw_line in stream:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line == self.TX_BEGIN:
+                    current_map = "tx"
+                    current_values = {}
+                    continue
+                if line == self.RX_BEGIN:
+                    current_map = "rx"
+                    current_values = {}
+                    continue
+                if line == self.TX_END:
+                    self._tx_snapshot = current_values
+                    current_map = None
+                    current_values = {}
+                    continue
+                if line == self.RX_END:
+                    self._rx_snapshot = current_values
+                    self._commit_snapshots()
+                    current_map = None
+                    current_values = {}
+                    continue
+
+                match = self.MAP_LINE_RE.match(line)
+                if match and current_map == match.group(1):
+                    pid = int(match.group(2))
+                    total = int(match.group(3))
+                    current_values[pid] = total
+                    continue
+
+                if self._error is None and "ERROR:" in line:
+                    self._error = line
+        finally:
+            if self._process is not None and self._process.poll() is not None and self._error is None:
+                self._error = f"bpftrace exited with {self._process.returncode}"
+            self._process = None
+
+    def _commit_snapshots(self) -> None:
+        combined: dict[int, tuple[float, float]] = {}
+        for pid in set(self._tx_snapshot) | set(self._rx_snapshot):
+            combined[pid] = (
+                self._rx_snapshot.get(pid, 0) / BPFTRACE_INTERVAL_SECONDS,
+                self._tx_snapshot.get(pid, 0) / BPFTRACE_INTERVAL_SECONDS,
+            )
+        with self._lock:
+            self._rates = combined
+
 
 class DashboardCollector:
     def __init__(self) -> None:
         self._docker = self._init_docker()
         self._gpu_ready = self._init_nvml()
         self._gpu_handles = self._load_gpu_handles() if self._gpu_ready else []
+        self._ebpf_traffic = EbpfProcessTrafficCollector()
         self._cgroup_cache: dict[str, Path | None] = {}
         self._proc_cpu_prev: dict[tuple[int, float], tuple[float, float]] = {}
         self._proc_history: dict[int, dict[str, float | int]] = {}  # pid -> {rss, cpu, timestamp}
         self._prev_net = psutil.net_io_counters()
         self._prev_net_ts = time.time()
+        self._container_net_prev: dict[str, tuple[int, int, float]] = {}
+        self._netns_prev: dict[str, tuple[int, int, float]] = {}
         self._last_pmon_ts = 0.0
         self._pmon_gpu_percent: dict[int, float | None] = {}
 
@@ -87,6 +235,7 @@ class DashboardCollector:
         return handles
 
     def shutdown(self) -> None:
+        self._ebpf_traffic.shutdown()
         if self._gpu_ready:
             try:
                 pynvml.nvmlShutdown()
@@ -158,6 +307,10 @@ class DashboardCollector:
         container_processes: dict[str, list[ProcessInfo]] = defaultdict(list)
         host_processes: list[ProcessInfo] = []
         seen_cpu_keys: set[tuple[int, float]] = set()
+        ebpf_rates = self._ebpf_traffic.get_rates() if self._ebpf_traffic.available else {}
+        namespace_rates: dict[str, tuple[float, float]] = {}
+        namespace_counts: dict[str, int] = defaultdict(int)
+        all_processes: list[ProcessInfo] = []
 
         attrs = ["pid", "ppid", "name", "cmdline", "username", "status", "create_time"]
         for proc in psutil.process_iter(attrs=attrs):
@@ -173,6 +326,17 @@ class DashboardCollector:
                 mem = proc.memory_info()
                 command = " ".join(info["cmdline"]) if info["cmdline"] else info["name"] or str(proc.pid)
                 container_id = self._container_id_for_pid(proc.pid)
+                net_namespace = self._net_namespace_for_pid(proc.pid)
+                net_recv_rate = 0.0
+                net_send_rate = 0.0
+                net_source = "ebpf" if proc.pid in ebpf_rates else "ns"
+                if proc.pid in ebpf_rates:
+                    net_recv_rate, net_send_rate = ebpf_rates[proc.pid]
+                elif net_namespace:
+                    namespace_counts[net_namespace] += 1
+                    if net_namespace not in namespace_rates:
+                        namespace_rates[net_namespace] = self._read_namespace_network_rates(net_namespace, proc.pid, now)
+                    net_recv_rate, net_send_rate = namespace_rates[net_namespace]
                 process = ProcessInfo(
                     pid=proc.pid,
                     ppid=info["ppid"],
@@ -185,7 +349,12 @@ class DashboardCollector:
                     gpu_percent=gpu_percent_by_pid.get(proc.pid),
                     container_id=container_id,
                     status=info.get("status") or "",
+                    net_recv_rate=net_recv_rate,
+                    net_send_rate=net_send_rate,
+                    net_namespace=net_namespace,
+                    net_source=net_source,
                 )
+                all_processes.append(process)
 
                 if container_id:
                     container_processes[container_id].append(process)
@@ -197,6 +366,9 @@ class DashboardCollector:
                 continue
 
         self._proc_cpu_prev = {key: value for key, value in self._proc_cpu_prev.items() if key in seen_cpu_keys}
+        for process in all_processes:
+            if process.net_namespace:
+                process.net_namespace_processes = namespace_counts.get(process.net_namespace, 0)
 
         host_processes.sort(key=lambda proc: (proc.ram_sum_bytes, proc.cpu_percent), reverse=True)
         return container_processes, host_processes[:DEFAULT_HOST_PROCESS_LIMIT]
@@ -244,7 +416,13 @@ class DashboardCollector:
                     ports=self._format_ports(attrs.get("NetworkSettings", {}).get("Ports", {})),
                     runtime=host_config.get("Runtime", ""),
                     uptime=self._state_uptime(state),
+                    net_recv_rate=0.0,
+                    net_send_rate=0.0,
                 )
+                if status == "run":
+                    recv_rate, send_rate = self._read_container_network_rates(container, now)
+                    info.net_recv_rate = recv_rate
+                    info.net_send_rate = send_rate
                 containers[container.id] = info
             except Exception:
                 continue
@@ -619,6 +797,74 @@ class DashboardCollector:
             return 0 if value == "max" else int(value)
         except Exception:
             return 0
+
+    def _net_namespace_for_pid(self, pid: int) -> str | None:
+        path = Path(f"/proc/{pid}/ns/net")
+        try:
+            return os.readlink(path)
+        except Exception:
+            return None
+
+    def _read_namespace_network_rates(self, namespace: str, pid: int, now: float) -> tuple[float, float]:
+        totals = self._read_proc_net_dev(pid)
+        if totals is None:
+            return (0.0, 0.0)
+
+        rx_total, tx_total = totals
+        previous = self._netns_prev.get(namespace)
+        self._netns_prev[namespace] = (rx_total, tx_total, now)
+        if previous is None:
+            return (0.0, 0.0)
+
+        prev_rx, prev_tx, prev_ts = previous
+        elapsed = max(now - prev_ts, 1e-6)
+        recv_rate = max(0.0, (rx_total - prev_rx) / elapsed)
+        send_rate = max(0.0, (tx_total - prev_tx) / elapsed)
+        return (recv_rate, send_rate)
+
+    def _read_proc_net_dev(self, pid: int) -> tuple[int, int] | None:
+        path = Path(f"/proc/{pid}/net/dev")
+        try:
+            lines = path.read_text().splitlines()
+        except Exception:
+            return None
+
+        rx_total = 0
+        tx_total = 0
+        for line in lines[2:]:
+            if ":" not in line:
+                continue
+            _, data = line.split(":", 1)
+            fields = data.split()
+            if len(fields) < 16:
+                continue
+            rx_total += int(fields[0])
+            tx_total += int(fields[8])
+        return (rx_total, tx_total)
+
+    def _read_container_network_rates(self, container, now: float) -> tuple[float, float]:
+        try:
+            stats = container.stats(stream=False)
+        except Exception:
+            return (0.0, 0.0)
+
+        networks = stats.get("networks") or {}
+        rx_total = 0
+        tx_total = 0
+        for network in networks.values():
+            rx_total += int(network.get("rx_bytes", 0) or 0)
+            tx_total += int(network.get("tx_bytes", 0) or 0)
+
+        previous = self._container_net_prev.get(container.id)
+        self._container_net_prev[container.id] = (rx_total, tx_total, now)
+        if previous is None:
+            return (0.0, 0.0)
+
+        prev_rx, prev_tx, prev_ts = previous
+        elapsed = max(now - prev_ts, 1e-6)
+        recv_rate = max(0.0, (rx_total - prev_rx) / elapsed)
+        send_rate = max(0.0, (tx_total - prev_tx) / elapsed)
+        return (recv_rate, send_rate)
 
     def _state_uptime(self, state: dict) -> str:
         started_at = state.get("StartedAt")

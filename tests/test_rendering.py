@@ -1,7 +1,7 @@
 import unittest
 
-from dgxtop.app import build_name_cell_text, clamp_column_content_width, fmt_bytes, normalize_series, render_two_line_chart
-from dgxtop.models import EntityRow
+from dgxtop.app import DgxTopApp, build_name_cell_text, clamp_column_content_width, fmt_bytes, normalize_series, render_two_line_chart
+from dgxtop.models import EntityRow, ProcessInfo
 
 
 class RenderingTests(unittest.TestCase):
@@ -68,6 +68,26 @@ class RenderingTests(unittest.TestCase):
             status="running",
         )
         self.assertEqual(build_name_cell_text(row, include_command=False), "   123 | python")
+
+    def test_process_detail_text_shows_namespace_network_traffic(self):
+        app = DgxTopApp()
+        process = ProcessInfo(
+            pid=4321,
+            ppid=1,
+            name="firefox",
+            command="firefox",
+            username="djmad",
+            cpu_percent=12.5,
+            rss_bytes=1024 * 1024,
+            net_recv_rate=2048.0,
+            net_send_rate=1024.0,
+            net_namespace="net:[4026531840]",
+            net_namespace_processes=7,
+        )
+
+        detail = app._detail_text(process)
+
+        self.assertIn("net(ns): 2.0K/s down | 1.0K/s up | shared by 7 pids", detail)
 
 if __name__ == "__main__":
     unittest.main()

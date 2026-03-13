@@ -1,13 +1,26 @@
 import signal
+import threading
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from dgxtop.app import ConfirmActionScreen, DgxTopApp
-from dgxtop.collectors import APIError, DashboardCollector, NotFound
+from dgxtop.collectors import APIError, DashboardCollector, EbpfProcessTrafficCollector, NotFound
 from dgxtop.models import ContainerInfo, ProcessInfo
 
 
 class CollectorActionTests(unittest.TestCase):
+    def test_ebpf_snapshot_commit_converts_bytes_to_rates(self):
+        collector = EbpfProcessTrafficCollector.__new__(EbpfProcessTrafficCollector)
+        collector._lock = threading.Lock()
+        collector._rates = {}
+        collector._tx_snapshot = {123: 4000}
+        collector._rx_snapshot = {123: 2000, 456: 1000}
+
+        EbpfProcessTrafficCollector._commit_snapshots(collector)
+
+        self.assertEqual(collector._rates[123], (1000.0, 2000.0))
+        self.assertEqual(collector._rates[456], (500.0, 0.0))
+
     def test_terminate_process_sends_sigterm(self):
         collector = DashboardCollector.__new__(DashboardCollector)
 

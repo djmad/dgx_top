@@ -20,6 +20,11 @@ class ProcessInfo:
     gpu_percent: float | None = None
     container_id: str | None = None
     status: str = ""
+    net_recv_rate: float = 0.0
+    net_send_rate: float = 0.0
+    net_namespace: str | None = None
+    net_namespace_processes: int = 0
+    net_source: str = "ns"
     # History tracking for activity detection
     prev_rss_bytes: int | None = None
     prev_cpu_percent: float | None = None
@@ -58,6 +63,8 @@ class ContainerInfo:
     ports: str = ""
     runtime: str = ""
     uptime: str = ""
+    net_recv_rate: float = 0.0
+    net_send_rate: float = 0.0
 
     @property
     def ram_sum_bytes(self) -> int:
@@ -123,3 +130,5 @@ class HistoryPoint:
     ram_percent: float
     gpu_percent: float | None
     gpu_memory_percent: float | None
+    net_recv_rate: float = 0.0
+    net_send_rate: float = 0.0

@@ -94,10 +94,22 @@ def render_two_line_chart(values: list[float | None], width: int) -> tuple[str, 
     return "".join(top_chars), "".join(bottom_chars)
 
 
-def render_metric_block(label: str, latest: float | None, values: list[float | None], width: int) -> tuple[str, str]:
-    prefix = f"{label} {fmt_percent(latest):>5}% "
+def render_metric_block(
+    label: str,
+    latest: float | None,
+    values: list[float | None],
+    width: int,
+    *,
+    prefix_value: str,
+    scale_max: float = 100.0,
+) -> tuple[str, str]:
+    prefix = f"{label} {prefix_value} "
     chart_width = max(8, width - len(prefix))
-    top, bottom = render_two_line_chart(values, chart_width)
+    scaled_values = [
+        None if value is None else (0.0 if scale_max <= 0 else max(0.0, min(100.0, value / scale_max * 100.0)))
+        for value in values
+    ]
+    top, bottom = render_two_line_chart(scaled_values, chart_width)
     return f"{prefix}{top}", f"{' ' * len(prefix)}{bottom}"
 
 
@@ -304,6 +316,8 @@ class DgxTopApp(App):
                     ram_percent=snapshot.system.ram_percent,
                     gpu_percent=snapshot.system.gpu_percent,
                     gpu_memory_percent=snapshot.system.gpu_memory_percent,
+                    net_recv_rate=snapshot.system.net_recv_rate,
+                    net_send_rate=snapshot.system.net_send_rate,
                 )
             )
             self._refresh_summary()
@@ -440,6 +454,7 @@ class DgxTopApp(App):
             ]
             if entity.command:
                 lines.append(f"cmd: {entity.command}")
+            lines.append(f"net: {fmt_rate(entity.net_recv_rate)} down | {fmt_rate(entity.net_send_rate)} up")
             lines.append(
                 "memory: "
                 f"anon {fmt_bytes(entity.memory.anon_bytes)} | file {fmt_bytes(entity.memory.file_bytes)} | "
@@ -457,10 +472,15 @@ class DgxTopApp(App):
             return "\n".join(lines)
 
         process: ProcessInfo = entity
+        source_label = "ebpf" if process.net_source == "ebpf" else "ns"
+        net_line = f"net({source_label}): {fmt_rate(process.net_recv_rate)} down | {fmt_rate(process.net_send_rate)} up"
+        if process.net_source != "ebpf" and process.net_namespace_processes > 1:
+            net_line += f" | shared by {process.net_namespace_processes} pids"
         lines = [
             process.name,
             f"pid: {process.pid}   ppid: {process.ppid}   user: {process.username}   status: {process.status or '--'}",
             f"cpu: {process.cpu_percent:.1f}%   rss: {fmt_bytes(process.rss_bytes)}   gpu mem: {fmt_bytes(process.gpu_memory_bytes)}",
+            net_line,
             f"cmd: {process.command}",
         ]
         return "\n".join(lines)
@@ -477,12 +497,61 @@ class DgxTopApp(App):
         total_width = max(48, trends.size.width - 4)
         block_width = max(22, (total_width - 2) // 2)
         series = [
-            render_metric_block("CPU ", window_points[-1].cpu_percent, [point.cpu_percent for point in window_points], block_width),
-            render_metric_block("GPU ", window_points[-1].gpu_percent, [point.gpu_percent for point in window_points], block_width),
-            render_metric_block("RAM ", window_points[-1].ram_percent, [point.ram_percent for point in window_points], block_width),
-            render_metric_block("VRAM", window_points[-1].gpu_memory_percent, [point.gpu_memory_percent for point in window_points], block_width),
+            render_metric_block(
+                "CPU ",
+                window_points[-1].cpu_percent,
+                [point.cpu_percent for point in window_points],
+                block_width,
+                prefix_value=f"{fmt_percent(window_points[-1].cpu_percent):>5}%",
+            ),
+            render_metric_block(
+                "GPU ",
+                window_points[-1].gpu_percent,
+                [point.gpu_percent for point in window_points],
+                block_width,
+                prefix_value=f"{fmt_percent(window_points[-1].gpu_percent):>5}%",
+            ),
+            render_metric_block(
+                "RAM ",
+                window_points[-1].ram_percent,
+                [point.ram_percent for point in window_points],
+                block_width,
+                prefix_value=f"{fmt_percent(window_points[-1].ram_percent):>5}%",
+            ),
+            render_metric_block(
+                "VRAM",
+                window_points[-1].gpu_memory_percent,
+                [point.gpu_memory_percent for point in window_points],
+                block_width,
+                prefix_value=f"{fmt_percent(window_points[-1].gpu_memory_percent):>5}%",
+            ),
         ]
-        for left, right in ((series[0], series[1]), (series[2], series[3])):
+        net_scale = max(
+            max((point.net_recv_rate for point in window_points), default=0.0),
+            max((point.net_send_rate for point in window_points), default=0.0),
+            1.0,
+        )
+        series.extend(
+            [
+                render_metric_block(
+                    "DOWN",
+                    window_points[-1].net_recv_rate,
+                    [point.net_recv_rate for point in window_points],
+                    block_width,
+                    prefix_value=f"{fmt_rate(window_points[-1].net_recv_rate):>8}",
+                    scale_max=net_scale,
+                ),
+                render_metric_block(
+                    "UP  ",
+                    window_points[-1].net_send_rate,
+                    [point.net_send_rate for point in window_points],
+                    block_width,
+                    prefix_value=f"{fmt_rate(window_points[-1].net_send_rate):>8}",
+                    scale_max=net_scale,
+                ),
+            ]
+        )
+        for left, right in ((series[0], series[1]), (series[2], series[3]), (series[4], series[5])):
             lines.append(f"{left[0]}  {right[0]}")
             lines.append(f"{left[1]}  {right[1]}")
         trends.update("\n".join(lines))

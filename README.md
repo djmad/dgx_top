@@ -15,8 +15,10 @@ It combines:
 - Unified table for Docker containers and high-signal host processes
 - Compact two-line host summary at the top
 - Separate CPU, GPU, RAM sum, RSS, cgroup memory, and GPU memory columns
-- Lower-third two-line trend graphs for CPU, GPU, RAM, and VRAM
+- Lower-third two-line trend graphs for CPU, GPU, RAM, VRAM, and host network up/down
 - Optional detail pane with commands, ports, memory split, and inner processes
+- Best-effort per-container network throughput in the detail pane for running Docker containers
+- Optional per-process `ebpf` traffic in the detail pane when the dashboard runs with root privileges; otherwise it falls back to namespace traffic
 - Stop / terminate and restart actions from inside the dashboard
 - Public-package friendly layout with `pyproject.toml`, tests, and docs
 
@@ -85,6 +87,7 @@ dgx-top
 - GPU memory comes from NVML per-process data.
 - On NVIDIA GB10 systems the aggregate GPU memory total may report as unsupported; in that case the header falls back to per-process used memory and leaves total as `--`.
 - Per-process GPU load is best-effort and depends on `nvidia-smi pmon`.
+- Per-process `ebpf` network traffic requires running the dashboard with privileges that allow `bpftrace`; unprivileged runs fall back to network-namespace traffic.
 - The root `dgx_top.py` file is a thin source launcher. The package entry point is `dgxtop`.
 
 ## Documentation
