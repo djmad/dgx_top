@@ -569,7 +569,7 @@ class DgxTopApp(App):
         self._refresh_summary()
         self._refresh_trends()
 
-    async def action_kill_selected(self) -> None:
+    def action_kill_selected(self) -> None:
         entity = self.current_entity()
         if entity is None:
             self.notify("No row selected", severity="warning")
@@ -582,10 +582,14 @@ class DgxTopApp(App):
             title = "Terminate process"
             message = f"Send SIGTERM to pid {entity.pid} ({entity.name})?"
 
-        confirmed = await self.push_screen_wait(ConfirmActionScreen(title, message))
-        if not confirmed:
-            return
+        async def handle_confirmation(confirmed: bool | None) -> None:
+            if not confirmed:
+                return
+            await self._kill_entity(entity)
 
+        self.push_screen(ConfirmActionScreen(title, message), callback=handle_confirmation)
+
+    async def _kill_entity(self, entity: ContainerInfo | ProcessInfo) -> None:
         try:
             if isinstance(entity, ContainerInfo):
                 message = await asyncio.to_thread(self.collector.stop_container, entity.container_id)
@@ -596,17 +600,23 @@ class DgxTopApp(App):
         except Exception as error:
             self.notify(str(error), severity="error")
 
-    async def action_restart_selected(self) -> None:
+    def action_restart_selected(self) -> None:
         entity = self.current_entity()
         if not isinstance(entity, ContainerInfo):
             self.notify("Restart works on docker rows only", severity="warning")
             return
 
-        confirmed = await self.push_screen_wait(
-            ConfirmActionScreen("Restart container", f"Restart {entity.name}?")
+        async def handle_confirmation(confirmed: bool | None) -> None:
+            if not confirmed:
+                return
+            await self._restart_container(entity)
+
+        self.push_screen(
+            ConfirmActionScreen("Restart container", f"Restart {entity.name}?"),
+            callback=handle_confirmation,
         )
-        if not confirmed:
-            return
+
+    async def _restart_container(self, entity: ContainerInfo) -> None:
         try:
             message = await asyncio.to_thread(self.collector.restart_container, entity.container_id)
             self.notify(message)

@@ -14,10 +14,12 @@ import psutil
 
 try:
     import docker
-    from docker.errors import DockerException
+    from docker.errors import APIError, DockerException, NotFound
 except ImportError:  # pragma: no cover - dependency failure fallback
     docker = None
+    APIError = Exception
     DockerException = Exception
+    NotFound = Exception
 
 try:
     import pynvml
@@ -94,20 +96,41 @@ class DashboardCollector:
     def restart_container(self, container_id: str) -> str:
         if self._docker is None:
             raise RuntimeError("Docker is not available")
-        container = self._docker.containers.get(container_id)
-        container.restart(timeout=10)
-        return f"Restarted {container.name}"
+        return self._container_action(container_id, "restart")
 
     def stop_container(self, container_id: str) -> str:
         if self._docker is None:
             raise RuntimeError("Docker is not available")
-        container = self._docker.containers.get(container_id)
-        container.stop(timeout=10)
-        return f"Stopped {container.name}"
+        return self._container_action(container_id, "stop")
 
     def terminate_process(self, pid: int) -> str:
-        os.kill(pid, signal.SIGTERM)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError as error:
+            raise RuntimeError(f"Process {pid} is no longer running") from error
+        except PermissionError as error:
+            raise RuntimeError(f"Permission denied terminating pid {pid}") from error
         return f"Sent SIGTERM to pid {pid}"
+
+    def _container_action(self, container_id: str, action: str) -> str:
+        assert self._docker is not None
+
+        try:
+            container = self._docker.containers.get(container_id)
+            getattr(container, action)(timeout=10)
+        except NotFound as error:
+            short_id = container_id[:12]
+            raise RuntimeError(f"Container {short_id} no longer exists") from error
+        except APIError as error:
+            short_id = container_id[:12]
+            detail = getattr(error, "explanation", None) or str(error)
+            raise RuntimeError(f"Docker {action} failed for {short_id}: {detail}") from error
+        except DockerException as error:
+            short_id = container_id[:12]
+            raise RuntimeError(f"Docker {action} failed for {short_id}: {error}") from error
+
+        action_label = f"{action}ed" if action.endswith("t") else f"{action}ped"
+        return f"{action_label.capitalize()} {container.name}"
 
     def sample(self, include_stopped: bool = False) -> DashboardSnapshot:
         now = time.time()
