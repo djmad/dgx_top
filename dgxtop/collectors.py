@@ -41,7 +41,7 @@ DEFAULT_HOST_PROCESS_LIMIT = 18
 HOST_PROCESS_THRESHOLD_BYTES = 128 * 1024 * 1024
 HOST_PROCESS_THRESHOLD_CPU = 0.5
 HISTORY_WINDOW_MIN = 60
-HISTORY_WINDOW_MAX = 24 * 60 * 60
+HISTORY_WINDOW_MAX = 14 * 24 * 60 * 60
 
 BPFTRACE_INTERVAL_SECONDS = 2.0
 
@@ -196,8 +196,8 @@ class DashboardCollector:
         self._cgroup_cache: dict[str, Path | None] = {}
         self._proc_cpu_prev: dict[tuple[int, float], tuple[float, float]] = {}
         self._proc_history: dict[int, dict[str, float | int]] = {}  # pid -> {rss, cpu, timestamp}
-        self._prev_net = psutil.net_io_counters()
-        self._prev_net_ts = time.time()
+        self._prev_net = None
+        self._prev_net_ts = None
         self._container_net_prev: dict[str, tuple[int, int, float]] = {}
         self._netns_prev: dict[str, tuple[int, int, float]] = {}
         self._last_pmon_ts = 0.0
@@ -517,12 +517,7 @@ class DashboardCollector:
         swap = psutil.swap_memory()
         disk = psutil.disk_usage("/")
 
-        net = psutil.net_io_counters()
-        delta_t = max(now - self._prev_net_ts, 1e-6)
-        recv_rate = max(0.0, (net.bytes_recv - self._prev_net.bytes_recv) / delta_t)
-        send_rate = max(0.0, (net.bytes_sent - self._prev_net.bytes_sent) / delta_t)
-        self._prev_net = net
-        self._prev_net_ts = now
+        recv_rate, send_rate = self._read_host_network_rates(now)
 
         running = sum(1 for container in containers.values() if container.status == "running")
         stopped = 0
@@ -562,6 +557,20 @@ class DashboardCollector:
             running_containers=running,
             stopped_containers=stopped,
         )
+
+    def _read_host_network_rates(self, now: float) -> tuple[float, float]:
+        net = psutil.net_io_counters()
+        if self._prev_net is None or self._prev_net_ts is None:
+            self._prev_net = net
+            self._prev_net_ts = now
+            return 0.0, 0.0
+
+        delta_t = max(now - self._prev_net_ts, 1e-6)
+        recv_rate = max(0.0, (net.bytes_recv - self._prev_net.bytes_recv) / delta_t)
+        send_rate = max(0.0, (net.bytes_sent - self._prev_net.bytes_sent) / delta_t)
+        self._prev_net = net
+        self._prev_net_ts = now
+        return recv_rate, send_rate
 
     def _read_gpu_state(self, now: float) -> dict:
         state = {

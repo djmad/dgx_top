@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from bisect import bisect_left, bisect_right
 from collections import deque
 
 from rich.text import Text
@@ -52,26 +53,130 @@ def fmt_history_window(seconds: int) -> str:
 
 
 LOWER_BARS = " ▁▂▃▄"
+VERTICAL_BARS = " ▁▂▃▄▅▆▇█"
 NAME_COLUMN_KEY = "name"
 NAME_COLUMN_MIN_WIDTH = 8
+REFRESH_INTERVAL_SECONDS = 2.0
+MAX_HISTORY_POINTS = max(1, int(HISTORY_WINDOW_MAX / REFRESH_INTERVAL_SECONDS) + 2)
 
 
-def normalize_series(values: list[float | None], width: int) -> list[float]:
+def build_history_window_steps(min_seconds: int, max_seconds: int) -> list[int]:
+    steps = [min_seconds]
+    current = min_seconds
+    snap_points = (3600, 86400)
+
+    for snap_point in snap_points:
+        while current < min(max_seconds, snap_point):
+            next_value = current * 2
+            current = snap_point if current < snap_point <= next_value else next_value
+            if current > max_seconds:
+                break
+            if current != steps[-1]:
+                steps.append(current)
+
+    while current < max_seconds:
+        current = min(max_seconds, current * 2)
+        if current != steps[-1]:
+            steps.append(current)
+
+    return steps
+
+
+HISTORY_WINDOW_STEPS = build_history_window_steps(HISTORY_WINDOW_MIN, HISTORY_WINDOW_MAX)
+
+
+def next_history_window(current: int) -> int:
+    index = bisect_right(HISTORY_WINDOW_STEPS, current)
+    return HISTORY_WINDOW_STEPS[min(index, len(HISTORY_WINDOW_STEPS) - 1)]
+
+
+def previous_history_window(current: int) -> int:
+    index = bisect_left(HISTORY_WINDOW_STEPS, current) - 1
+    return HISTORY_WINDOW_STEPS[max(index, 0)]
+
+
+def build_timeline_series(
+    points: list[HistoryPoint],
+    width: int,
+    history_window: int,
+    now: float,
+    value_getter,
+) -> list[float | None]:
+    bucket_count = max(8, width)
+    if history_window <= 0:
+        return [None] * bucket_count
+
+    seconds_per_bucket = history_window / bucket_count
+    end_time = math.ceil(now / max(seconds_per_bucket, 1e-6)) * seconds_per_bucket
+    start_time = end_time - history_window
+    buckets: list[list[float]] = [[] for _ in range(bucket_count)]
+    for point in points:
+        if point.timestamp < start_time or point.timestamp > now:
+            continue
+        value = value_getter(point)
+        if value is None or math.isnan(value):
+            continue
+        position = (point.timestamp - start_time) / history_window
+        index = min(bucket_count - 1, max(0, int(position * bucket_count)))
+        buckets[index].append(value)
+
+    if seconds_per_bucket > REFRESH_INTERVAL_SECONDS:
+        return [None if not bucket else max(bucket) for bucket in buckets]
+
+    series = [None if not bucket else sum(bucket) / len(bucket) for bucket in buckets]
+    max_gap = max(1, int(math.ceil(REFRESH_INTERVAL_SECONDS / max(seconds_per_bucket, 1e-6))))
+    return interpolate_small_gaps(series, max_gap)
+
+
+def interpolate_small_gaps(values: list[float | None], max_gap: int) -> list[float | None]:
+    if max_gap <= 0:
+        return values
+
+    filled = list(values)
+    index = 0
+    while index < len(filled):
+        if filled[index] is not None:
+            index += 1
+            continue
+
+        gap_start = index
+        while index < len(filled) and filled[index] is None:
+            index += 1
+        gap_end = index
+        gap_size = gap_end - gap_start
+
+        left_index = gap_start - 1
+        right_index = gap_end
+        if gap_size > max_gap or left_index < 0 or right_index >= len(filled):
+            continue
+        left_value = filled[left_index]
+        right_value = filled[right_index]
+        if left_value is None or right_value is None:
+            continue
+
+        step = (right_value - left_value) / (gap_size + 1)
+        for offset in range(gap_size):
+            filled[gap_start + offset] = left_value + (step * (offset + 1))
+
+    return filled
+
+
+def normalize_series(values: list[float | None], width: int) -> list[float | None]:
     width = max(8, width)
-    cleaned = [0.0 if value is None or math.isnan(value) else max(0.0, min(100.0, value)) for value in values]
+    cleaned = [None if value is None or math.isnan(value) else max(0.0, min(100.0, value)) for value in values]
     if not cleaned:
-        return [0.0] * width
+        return [None] * width
     if len(cleaned) > width:
         bucket = len(cleaned) / width
-        compressed: list[float] = []
+        compressed: list[float | None] = []
         for index in range(width):
             start = int(index * bucket)
             end = max(start + 1, int((index + 1) * bucket))
-            chunk = cleaned[start:end]
-            compressed.append(sum(chunk) / len(chunk))
+            chunk = [value for value in cleaned[start:end] if value is not None]
+            compressed.append(None if not chunk else sum(chunk) / len(chunk))
         cleaned = compressed
     elif len(cleaned) < width:
-        cleaned = ([cleaned[0]] * (width - len(cleaned))) + cleaned
+        cleaned = ([None] * (width - len(cleaned))) + cleaned
     return cleaned
 
 
@@ -80,6 +185,10 @@ def render_two_line_chart(values: list[float | None], width: int) -> tuple[str, 
     top_chars: list[str] = []
     bottom_chars: list[str] = []
     for value in cleaned:
+        if value is None:
+            top_chars.append(" ")
+            bottom_chars.append(" ")
+            continue
         level = int(round(value / 100.0 * 8))
         level = max(0, min(8, level))
         if level == 0:
@@ -94,6 +203,31 @@ def render_two_line_chart(values: list[float | None], width: int) -> tuple[str, 
     return "".join(top_chars), "".join(bottom_chars)
 
 
+def scale_chart_values(values: list[float | None], scale_max: float = 100.0) -> list[float | None]:
+    return [
+        None if value is None else (0.0 if scale_max <= 0 else max(0.0, min(100.0, value / scale_max * 100.0)))
+        for value in values
+    ]
+
+
+def render_tall_chart(values: list[float | None], width: int, height: int) -> list[str]:
+    cleaned = normalize_series(values, width)
+    chart_height = max(1, height)
+    levels = [None if value is None else int(round(value / 100.0 * chart_height * 8)) for value in cleaned]
+    lines: list[str] = []
+    for row in range(chart_height):
+        row_base = (chart_height - row - 1) * 8
+        chars: list[str] = []
+        for level in levels:
+            if level is None:
+                chars.append(" ")
+                continue
+            fill = max(0, min(8, level - row_base))
+            chars.append(VERTICAL_BARS[fill])
+        lines.append("".join(chars))
+    return lines
+
+
 def render_metric_block(
     label: str,
     latest: float | None,
@@ -105,10 +239,27 @@ def render_metric_block(
 ) -> tuple[str, str]:
     prefix = f"{label} {prefix_value} "
     chart_width = max(8, width - len(prefix))
-    scaled_values = [
-        None if value is None else (0.0 if scale_max <= 0 else max(0.0, min(100.0, value / scale_max * 100.0)))
-        for value in values
-    ]
+    scaled_values = scale_chart_values(values, scale_max)
+    top, bottom = render_two_line_chart(scaled_values, chart_width)
+    return f"{prefix}{top}", f"{' ' * len(prefix)}{bottom}"
+
+
+def render_history_metric_block(
+    label: str,
+    latest: float | None,
+    points: list[HistoryPoint],
+    width: int,
+    *,
+    prefix_value: str,
+    history_window: int,
+    now: float,
+    value_getter,
+    scale_max: float = 100.0,
+) -> tuple[str, str]:
+    prefix = f"{label} {prefix_value} "
+    chart_width = max(8, width - len(prefix))
+    values = build_timeline_series(points, chart_width, history_window, now, value_getter)
+    scaled_values = scale_chart_values(values, scale_max)
     top, bottom = render_two_line_chart(scaled_values, chart_width)
     return f"{prefix}{top}", f"{' ' * len(prefix)}{bottom}"
 
@@ -195,8 +346,16 @@ class DgxTopApp(App):
         padding: 0 1;
     }
 
+    #summary.hidden {
+        display: none;
+    }
+
     #main-area {
         height: 2fr;
+    }
+
+    #main-area.hidden {
+        display: none;
     }
 
     #rows {
@@ -221,6 +380,11 @@ class DgxTopApp(App):
         border: round $panel;
     }
 
+    #trends.fullscreen {
+        padding: 0;
+        border: none;
+    }
+
     #footer {
         height: 1;
         padding: 0 1;
@@ -233,7 +397,8 @@ class DgxTopApp(App):
         Binding("d", "toggle_details", "Detail"),
         Binding("x", "toggle_stopped", "Stopped"),
         Binding("c", "sort_cpu", "CPU"),
-        Binding("g", "sort_gpu", "GPU"),
+        Binding("g", "toggle_graph_mode", "Graphs"),
+        Binding("shift+g", "sort_gpu", "GPU"),
         Binding("m", "sort_ram_sum", "RAM"),
         Binding("v", "sort_gpu_mem", "VRAM"),
         Binding("plus,equals", "expand_history", "History+"),
@@ -261,12 +426,13 @@ class DgxTopApp(App):
         self.history_window = 3600
         self.show_stopped = False
         self.details_visible = False
+        self.graph_mode = False
         self.sort_field = "ram_sum_bytes"
         self.sort_desc = True
         self.selected_key: str | None = None
         self._visible_keys: list[str] = []
         self._refresh_lock = asyncio.Lock()
-        self.history: deque[HistoryPoint] = deque(maxlen=HISTORY_WINDOW_MAX)
+        self.history: deque[HistoryPoint] = deque(maxlen=MAX_HISTORY_POINTS)
 
     def compose(self) -> ComposeResult:
         yield Static("", id="summary")
@@ -293,11 +459,9 @@ class DgxTopApp(App):
         table.add_column("GPU MEM", width=7, key="gpu_mem")
         table.add_column("Status", width=7, key="status")
 
-        self.query_one("#footer", Static).update(
-            "Keys: q quit  d detail  c cpu  g gpu  m ram-sum  v vram  x stopped  k kill  r restart  +/- zoom"
-        )
+        self._refresh_footer()
 
-        self.set_interval(2.0, self._schedule_refresh)
+        self.set_interval(REFRESH_INTERVAL_SECONDS, self._schedule_refresh)
         self._schedule_refresh()
 
     def on_unmount(self) -> None:
@@ -325,6 +489,12 @@ class DgxTopApp(App):
             self._refresh_details()
             self._refresh_trends()
 
+    def _refresh_footer(self) -> None:
+        graph_hint = "g table" if self.graph_mode else "g graphs"
+        self.query_one("#footer", Static).update(
+            f"Keys: q quit  {graph_hint}  shift+g gpu  d detail  c cpu  m ram-sum  v vram  x stopped  k kill  r restart  +/- zoom"
+        )
+
     def _schedule_refresh(self) -> None:
         self.run_worker(self.refresh_dashboard(), exclusive=True)
 
@@ -332,7 +502,7 @@ class DgxTopApp(App):
         assert self.snapshot is not None
         system = self.snapshot.system
         line_one = (
-            f"DGX_TOP  refresh:2s  history:{fmt_history_window(self.history_window)}  "
+            f"DGX_TOP  refresh:{int(REFRESH_INTERVAL_SECONDS)}s  history:{fmt_history_window(self.history_window)}  "
             f"sort:{self.sort_label()}  show:{'all' if self.show_stopped else 'running'}  "
             f"docker:{system.running_containers} up / {system.stopped_containers} stopped"
         )
@@ -493,37 +663,53 @@ class DgxTopApp(App):
             trends.update("Window: --")
             return
 
+        if self.graph_mode:
+            trends.update(self._render_fullscreen_trends(window_points, trends.size.width, trends.size.height))
+            return
+
         lines = [f"Window: {fmt_history_window(self.history_window)}"]
         total_width = max(48, trends.size.width - 4)
         block_width = max(22, (total_width - 2) // 2)
         series = [
-            render_metric_block(
+            render_history_metric_block(
                 "CPU ",
                 window_points[-1].cpu_percent,
-                [point.cpu_percent for point in window_points],
+                window_points,
                 block_width,
                 prefix_value=f"{fmt_percent(window_points[-1].cpu_percent):>5}%",
+                history_window=self.history_window,
+                now=now,
+                value_getter=lambda point: point.cpu_percent,
             ),
-            render_metric_block(
+            render_history_metric_block(
                 "GPU ",
                 window_points[-1].gpu_percent,
-                [point.gpu_percent for point in window_points],
+                window_points,
                 block_width,
                 prefix_value=f"{fmt_percent(window_points[-1].gpu_percent):>5}%",
+                history_window=self.history_window,
+                now=now,
+                value_getter=lambda point: point.gpu_percent,
             ),
-            render_metric_block(
+            render_history_metric_block(
                 "RAM ",
                 window_points[-1].ram_percent,
-                [point.ram_percent for point in window_points],
+                window_points,
                 block_width,
                 prefix_value=f"{fmt_percent(window_points[-1].ram_percent):>5}%",
+                history_window=self.history_window,
+                now=now,
+                value_getter=lambda point: point.ram_percent,
             ),
-            render_metric_block(
+            render_history_metric_block(
                 "VRAM",
                 window_points[-1].gpu_memory_percent,
-                [point.gpu_memory_percent for point in window_points],
+                window_points,
                 block_width,
                 prefix_value=f"{fmt_percent(window_points[-1].gpu_memory_percent):>5}%",
+                history_window=self.history_window,
+                now=now,
+                value_getter=lambda point: point.gpu_memory_percent,
             ),
         ]
         net_scale = max(
@@ -536,7 +722,13 @@ class DgxTopApp(App):
                 render_metric_block(
                     "DOWN",
                     window_points[-1].net_recv_rate,
-                    [point.net_recv_rate for point in window_points],
+                    build_timeline_series(
+                        window_points,
+                        max(8, block_width - len(f"DOWN {fmt_rate(window_points[-1].net_recv_rate):>8} ")),
+                        self.history_window,
+                        now,
+                        lambda point: point.net_recv_rate,
+                    ),
                     block_width,
                     prefix_value=f"{fmt_rate(window_points[-1].net_recv_rate):>8}",
                     scale_max=net_scale,
@@ -544,7 +736,13 @@ class DgxTopApp(App):
                 render_metric_block(
                     "UP  ",
                     window_points[-1].net_send_rate,
-                    [point.net_send_rate for point in window_points],
+                    build_timeline_series(
+                        window_points,
+                        max(8, block_width - len(f"UP   {fmt_rate(window_points[-1].net_send_rate):>8} ")),
+                        self.history_window,
+                        now,
+                        lambda point: point.net_send_rate,
+                    ),
                     block_width,
                     prefix_value=f"{fmt_rate(window_points[-1].net_send_rate):>8}",
                     scale_max=net_scale,
@@ -555,6 +753,97 @@ class DgxTopApp(App):
             lines.append(f"{left[0]}  {right[0]}")
             lines.append(f"{left[1]}  {right[1]}")
         trends.update("\n".join(lines))
+
+    def _render_fullscreen_trends(self, window_points: list[HistoryPoint], width: int, height: int) -> str:
+        total_width = max(48, width)
+        block_width = max(22, (total_width - 2) // 2)
+        network_scale = max(
+            max((point.net_recv_rate for point in window_points), default=0.0),
+            max((point.net_send_rate for point in window_points), default=0.0),
+            1.0,
+        )
+        metrics = [
+            (
+                "CPU",
+                f"{fmt_percent(window_points[-1].cpu_percent):>5}%",
+                scale_chart_values(
+                    build_timeline_series(window_points, block_width, self.history_window, window_points[-1].timestamp, lambda point: point.cpu_percent)
+                ),
+            ),
+            (
+                "GPU",
+                f"{fmt_percent(window_points[-1].gpu_percent):>5}%",
+                scale_chart_values(
+                    build_timeline_series(window_points, block_width, self.history_window, window_points[-1].timestamp, lambda point: point.gpu_percent)
+                ),
+            ),
+            (
+                "RAM",
+                f"{fmt_percent(window_points[-1].ram_percent):>5}%",
+                scale_chart_values(
+                    build_timeline_series(window_points, block_width, self.history_window, window_points[-1].timestamp, lambda point: point.ram_percent)
+                ),
+            ),
+            (
+                "VRAM",
+                f"{fmt_percent(window_points[-1].gpu_memory_percent):>5}%",
+                scale_chart_values(
+                    build_timeline_series(
+                        window_points,
+                        block_width,
+                        self.history_window,
+                        window_points[-1].timestamp,
+                        lambda point: point.gpu_memory_percent,
+                    )
+                ),
+            ),
+            (
+                "DOWN",
+                f"{fmt_rate(window_points[-1].net_recv_rate):>8}",
+                scale_chart_values(
+                    build_timeline_series(
+                        window_points,
+                        block_width,
+                        self.history_window,
+                        window_points[-1].timestamp,
+                        lambda point: point.net_recv_rate,
+                    ),
+                    network_scale,
+                ),
+            ),
+            (
+                "UP",
+                f"{fmt_rate(window_points[-1].net_send_rate):>8}",
+                scale_chart_values(
+                    build_timeline_series(
+                        window_points,
+                        block_width,
+                        self.history_window,
+                        window_points[-1].timestamp,
+                        lambda point: point.net_send_rate,
+                    ),
+                    network_scale,
+                ),
+            ),
+        ]
+
+        metric_rows = 3
+        per_row_height = max(4, max(12, height - 1) // metric_rows)
+        chart_height = max(3, per_row_height - 1)
+        lines = [f"Fullscreen graphs  window:{fmt_history_window(self.history_window)}  net-scale:{fmt_rate(network_scale)}"]
+
+        for row_index in range(0, len(metrics), 2):
+            left_label, left_value, left_values = metrics[row_index]
+            right_label, right_value, right_values = metrics[row_index + 1]
+            left_header = f"{left_label} {left_value}".ljust(block_width)
+            right_header = f"{right_label} {right_value}".ljust(block_width)
+            lines.append(f"{left_header}  {right_header}")
+            left_chart = render_tall_chart(left_values, block_width, chart_height)
+            right_chart = render_tall_chart(right_values, block_width, chart_height)
+            for left_line, right_line in zip(left_chart, right_chart):
+                lines.append(f"{left_line}  {right_line}")
+
+        return "\n".join(lines)
 
     def current_entity(self):
         if self.snapshot is None or self.selected_key is None:
@@ -618,6 +907,22 @@ class DgxTopApp(App):
         if self.snapshot is not None:
             self._refresh_table()
 
+    def action_toggle_graph_mode(self) -> None:
+        self.graph_mode = not self.graph_mode
+        summary = self.query_one("#summary", Static)
+        main_area = self.query_one("#main-area", Horizontal)
+        trends = self.query_one("#trends", Static)
+        if self.graph_mode:
+            summary.add_class("hidden")
+            main_area.add_class("hidden")
+            trends.add_class("fullscreen")
+        else:
+            summary.remove_class("hidden")
+            main_area.remove_class("hidden")
+            trends.remove_class("fullscreen")
+        self._refresh_footer()
+        self._refresh_trends()
+
     def on_resize(self) -> None:
         if self.snapshot is None:
             return
@@ -629,12 +934,12 @@ class DgxTopApp(App):
         self.run_worker(self.refresh_dashboard(), exclusive=True)
 
     def action_expand_history(self) -> None:
-        self.history_window = min(HISTORY_WINDOW_MAX, self.history_window * 2)
+        self.history_window = next_history_window(self.history_window)
         self._refresh_summary()
         self._refresh_trends()
 
     def action_shrink_history(self) -> None:
-        self.history_window = max(HISTORY_WINDOW_MIN, self.history_window // 2)
+        self.history_window = previous_history_window(self.history_window)
         self._refresh_summary()
         self._refresh_trends()
 

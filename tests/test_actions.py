@@ -1,6 +1,7 @@
 import signal
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from dgxtop.app import ConfirmActionScreen, DgxTopApp
@@ -104,6 +105,24 @@ class CollectorActionTests(unittest.TestCase):
         self.assertIn("abcdef1234567890", containers)
         self.assertEqual(containers["abcdef1234567890"].net_recv_rate, 128.0)
         self.assertEqual(containers["abcdef1234567890"].net_send_rate, 64.0)
+
+    def test_read_host_network_rates_uses_first_sample_as_baseline(self):
+        collector = DashboardCollector.__new__(DashboardCollector)
+        collector._prev_net = None
+        collector._prev_net_ts = None
+
+        with patch(
+            "dgxtop.collectors.psutil.net_io_counters",
+            side_effect=[
+                SimpleNamespace(bytes_recv=1000, bytes_sent=500),
+                SimpleNamespace(bytes_recv=5000, bytes_sent=2500),
+            ],
+        ):
+            first = collector._read_host_network_rates(10.0)
+            second = collector._read_host_network_rates(12.0)
+
+        self.assertEqual(first, (0.0, 0.0))
+        self.assertEqual(second, (2000.0, 1000.0))
 
 
 class AppActionTests(unittest.IsolatedAsyncioTestCase):

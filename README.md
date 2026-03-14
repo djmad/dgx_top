@@ -73,7 +73,8 @@ dgx-top
 - `q`: quit
 - `d`: toggle detail pane
 - `c`: sort by CPU
-- `g`: sort by GPU load
+- `g`: toggle full-screen graph view
+- `shift+g`: sort by GPU load
 - `m`: sort by RAM sum
 - `v`: sort by GPU memory
 - `x`: toggle stopped containers
