@@ -285,7 +285,7 @@ class DashboardCollector:
         now = time.time()
         gpu_state = self._read_gpu_state(now)
         processes, host_processes = self._read_processes(now, gpu_state["process_memory"], gpu_state["process_percent"])
-        containers = self._read_containers(processes, include_stopped)
+        containers = self._read_containers(processes, include_stopped, now)
 
         rows = self._build_rows(containers, host_processes, gpu_state["util_percent"], now)
         system = self._read_system(include_stopped, gpu_state, containers, now)
@@ -373,7 +373,12 @@ class DashboardCollector:
         host_processes.sort(key=lambda proc: (proc.ram_sum_bytes, proc.cpu_percent), reverse=True)
         return container_processes, host_processes[:DEFAULT_HOST_PROCESS_LIMIT]
 
-    def _read_containers(self, processes: dict[str, list[ProcessInfo]], include_stopped: bool) -> dict[str, ContainerInfo]:
+    def _read_containers(
+        self,
+        processes: dict[str, list[ProcessInfo]],
+        include_stopped: bool,
+        now: float,
+    ) -> dict[str, ContainerInfo]:
         containers: dict[str, ContainerInfo] = {}
 
         if self._docker is None:

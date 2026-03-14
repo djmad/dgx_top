@@ -65,6 +65,46 @@ class CollectorActionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Docker stop failed for abcdef123456"):
             collector.stop_container("abcdef1234567890")
 
+    def test_read_containers_keeps_running_container_when_network_rates_are_enabled(self):
+        collector = DashboardCollector.__new__(DashboardCollector)
+        collector._docker = Mock()
+        collector._cgroup_cache = {}
+        collector._container_image = Mock(return_value="trainer:latest")
+        collector._read_cgroup_memory = Mock()
+        collector._read_cgroup_memory.return_value = Mock(
+            total_bytes=0,
+            peak_bytes=0,
+            anon_bytes=0,
+            file_bytes=0,
+            kernel_bytes=0,
+            shmem_bytes=0,
+            pagetables_bytes=0,
+        )
+        collector._aggregate_gpu_percent = Mock(return_value=None)
+        collector._join_command = Mock(return_value="")
+        collector._format_ports = Mock(return_value="")
+        collector._state_uptime = Mock(return_value="")
+        collector._shorten_docker_status = DashboardCollector._shorten_docker_status.__get__(collector, DashboardCollector)
+        collector._read_container_network_rates = Mock(return_value=(128.0, 64.0))
+
+        container = Mock()
+        container.id = "abcdef1234567890"
+        container.name = "trainer"
+        container.status = "running"
+        container.attrs = {
+            "State": {"Status": "running", "Pid": 1234},
+            "Config": {},
+            "HostConfig": {},
+            "NetworkSettings": {"Ports": {}},
+        }
+        collector._docker.containers.list.return_value = [container]
+
+        containers = collector._read_containers({}, include_stopped=False, now=100.0)
+
+        self.assertIn("abcdef1234567890", containers)
+        self.assertEqual(containers["abcdef1234567890"].net_recv_rate, 128.0)
+        self.assertEqual(containers["abcdef1234567890"].net_send_rate, 64.0)
+
 
 class AppActionTests(unittest.IsolatedAsyncioTestCase):
     async def test_kill_selected_uses_confirm_callback_without_push_screen_wait(self):
