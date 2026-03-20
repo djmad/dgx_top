@@ -1,4 +1,5 @@
 import signal
+import time
 import threading
 import unittest
 from types import SimpleNamespace
@@ -6,7 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from dgxtop.app import ConfirmActionScreen, DgxTopApp
 from dgxtop.collectors import APIError, DashboardCollector, EbpfProcessTrafficCollector, NotFound
-from dgxtop.models import ContainerInfo, ProcessInfo
+from dgxtop.models import ContainerInfo, DashboardSnapshot, EntityRow, ProcessInfo, SystemSnapshot
 
 
 class CollectorActionTests(unittest.TestCase):
@@ -197,6 +198,80 @@ class AppActionTests(unittest.IsolatedAsyncioTestCase):
         app.collector.restart_container.assert_called_once_with("abcdef1234567890")
         app.refresh_dashboard.assert_awaited_once()
         app.notify.assert_called_with("Restarted trainer")
+
+    async def test_slow_refresh_still_renders_snapshot(self):
+        app = DgxTopApp()
+        app.collector = Mock()
+        app.collector.shutdown = Mock()
+
+        def slow_sample(include_stopped: bool = False) -> DashboardSnapshot:
+            time.sleep(2.2)
+            return DashboardSnapshot(
+                system=SystemSnapshot(
+                    cpu_percent=12.0,
+                    cpu_temp_c=55.0,
+                    load_avg=(1.0, 0.5, 0.25),
+                    ram_used_bytes=2_000_000_000,
+                    ram_total_bytes=4_000_000_000,
+                    ram_percent=50.0,
+                    swap_used_bytes=0,
+                    swap_total_bytes=1_000_000_000,
+                    disk_used_bytes=10_000_000_000,
+                    disk_total_bytes=20_000_000_000,
+                    disk_percent=50.0,
+                    net_recv_rate=1024.0,
+                    net_send_rate=2048.0,
+                    gpu_name="Test GPU",
+                    gpu_percent=33.0,
+                    gpu_temp_c=60.0,
+                    gpu_memory_used_bytes=1_000_000_000,
+                    gpu_memory_total_bytes=2_000_000_000,
+                    gpu_memory_percent=50.0,
+                    running_containers=0,
+                    stopped_containers=0,
+                ),
+                rows=[
+                    EntityRow(
+                        key="host:1234",
+                        kind="host",
+                        name="python",
+                        pid=1234,
+                        image=None,
+                        command="python train.py",
+                        cpu_percent=12.0,
+                        gpu_percent=33.0,
+                        ram_sum_bytes=512_000_000,
+                        ram_rss_bytes=256_000_000,
+                        ram_cgroup_bytes=None,
+                        gpu_memory_bytes=256_000_000,
+                        status="CPU",
+                    )
+                ],
+                containers={},
+                host_processes={
+                    "host:1234": ProcessInfo(
+                        pid=1234,
+                        ppid=1,
+                        name="python",
+                        command="python train.py",
+                        username="tester",
+                        cpu_percent=12.0,
+                        rss_bytes=256_000_000,
+                        gpu_memory_bytes=256_000_000,
+                        gpu_percent=33.0,
+                        status="running",
+                    )
+                },
+                timestamp=time.time(),
+            )
+
+        app.collector.sample = Mock(side_effect=slow_sample)
+
+        async with app.run_test() as pilot:
+            await pilot.pause(3.5)
+            self.assertEqual(app.query_one("#rows").row_count, 1)
+            self.assertIn("DGX_TOP", app.query_one("#summary").content)
+            self.assertIn("Window:", app.query_one("#trends").content)
 
 
 if __name__ == "__main__":

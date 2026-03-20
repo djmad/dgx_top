@@ -496,7 +496,10 @@ class DgxTopApp(App):
         )
 
     def _schedule_refresh(self) -> None:
-        self.run_worker(self.refresh_dashboard(), exclusive=True)
+        # Sampling can take longer than the 2s timer on busy systems.
+        # Let the lock inside refresh_dashboard() drop overlapping refreshes
+        # instead of canceling the in-flight worker before it can render.
+        self.run_worker(self.refresh_dashboard())
 
     def _refresh_summary(self) -> None:
         assert self.snapshot is not None
@@ -931,7 +934,7 @@ class DgxTopApp(App):
 
     def action_toggle_stopped(self) -> None:
         self.show_stopped = not self.show_stopped
-        self.run_worker(self.refresh_dashboard(), exclusive=True)
+        self.run_worker(self.refresh_dashboard())
 
     def action_expand_history(self) -> None:
         self.history_window = next_history_window(self.history_window)
