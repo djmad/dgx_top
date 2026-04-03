@@ -252,6 +252,11 @@ class DashboardCollector:
             raise RuntimeError("Docker is not available")
         return self._container_action(container_id, "stop")
 
+    def kill_container(self, container_id: str) -> str:
+        if self._docker is None:
+            raise RuntimeError("Docker is not available")
+        return self._container_action(container_id, "kill")
+
     def terminate_process(self, pid: int) -> str:
         try:
             os.kill(pid, signal.SIGTERM)
@@ -266,7 +271,10 @@ class DashboardCollector:
 
         try:
             container = self._docker.containers.get(container_id)
-            getattr(container, action)(timeout=10)
+            if action == "kill":
+                container.kill()
+            else:
+                getattr(container, action)(timeout=10)
         except NotFound as error:
             short_id = container_id[:12]
             raise RuntimeError(f"Container {short_id} no longer exists") from error
@@ -278,8 +286,13 @@ class DashboardCollector:
             short_id = container_id[:12]
             raise RuntimeError(f"Docker {action} failed for {short_id}: {error}") from error
 
-        action_label = f"{action}ed" if action.endswith("t") else f"{action}ped"
-        return f"{action_label.capitalize()} {container.name}"
+        if action == "kill":
+            action_label = "Killed"
+        elif action.endswith("t"):
+            action_label = f"{action}ed".capitalize()
+        else:
+            action_label = f"{action}ped".capitalize()
+        return f"{action_label} {container.name}"
 
     def sample(self, include_stopped: bool = False) -> DashboardSnapshot:
         now = time.time()

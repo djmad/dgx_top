@@ -35,7 +35,7 @@
 1. The UI schedules periodic refreshes.
 2. `DashboardCollector.sample()` builds a `DashboardSnapshot`.
 3. The app sorts and renders rows based on the active field.
-4. History points are stored for CPU, RAM, GPU, and VRAM.
+4. History points are stored for CPU, RAM, GPU, VRAM, and host network rates, then persisted to a local JSONL history file.
 5. The trend panel compresses the visible window to the current terminal width.
 
 ## Packaging

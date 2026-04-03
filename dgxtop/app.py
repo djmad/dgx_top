@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import math
+import time
 from bisect import bisect_left, bisect_right
 from collections import deque
+from enum import Enum
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -13,7 +16,14 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Static
 
 from .collectors import DashboardCollector, HISTORY_WINDOW_MAX, HISTORY_WINDOW_MIN
+from .history_store import HistoryStore
 from .models import ContainerInfo, DashboardSnapshot, EntityRow, HistoryPoint, ProcessInfo
+
+
+class WatchdogMode(Enum):
+    OFF = "off"
+    BIGGEST = "biggest"
+    MANUAL = "manual"
 
 
 def fmt_bytes(value: int | None) -> str:
@@ -405,6 +415,8 @@ class DgxTopApp(App):
         Binding("minus", "shrink_history", "History-"),
         Binding("k", "kill_selected", "Kill"),
         Binding("r", "restart_selected", "Restart"),
+        Binding("w", "cycle_watchdog", "Watchdog"),
+        Binding("W", "set_watchdog_target", "WD target"),
     ]
 
     SORT_COLUMNS = [
@@ -419,7 +431,13 @@ class DgxTopApp(App):
         ("status", "status"),
     ]
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        history_store: HistoryStore | None = None,
+        watchdog_mode: WatchdogMode = WatchdogMode.OFF,
+        watchdog_grace_bytes: int = 1 * 1024 ** 3,
+        watchdog_container: str | None = None,
+    ) -> None:
         super().__init__()
         self.collector = DashboardCollector()
         self.snapshot: DashboardSnapshot | None = None
@@ -432,7 +450,16 @@ class DgxTopApp(App):
         self.selected_key: str | None = None
         self._visible_keys: list[str] = []
         self._refresh_lock = asyncio.Lock()
-        self.history: deque[HistoryPoint] = deque(maxlen=MAX_HISTORY_POINTS)
+        self.history: deque[HistoryPoint] = deque()
+        self.history_store = history_store or HistoryStore(
+            max_age_seconds=HISTORY_WINDOW_MAX,
+            max_points=MAX_HISTORY_POINTS,
+        )
+        self._history_store_error: str | None = None
+        self.watchdog_mode = watchdog_mode
+        self.watchdog_grace_bytes = watchdog_grace_bytes
+        self.watchdog_container = watchdog_container
+        self._watchdog_last_kill: float = 0.0
 
     def compose(self) -> ComposeResult:
         yield Static("", id="summary")
@@ -460,6 +487,7 @@ class DgxTopApp(App):
         table.add_column("Status", width=7, key="status")
 
         self._refresh_footer()
+        self._load_persisted_history()
 
         self.set_interval(REFRESH_INTERVAL_SECONDS, self._schedule_refresh)
         self._schedule_refresh()
@@ -473,26 +501,63 @@ class DgxTopApp(App):
         async with self._refresh_lock:
             snapshot = await asyncio.to_thread(self.collector.sample, self.show_stopped)
             self.snapshot = snapshot
-            self.history.append(
-                HistoryPoint(
-                    timestamp=snapshot.timestamp,
-                    cpu_percent=snapshot.system.cpu_percent,
-                    ram_percent=snapshot.system.ram_percent,
-                    gpu_percent=snapshot.system.gpu_percent,
-                    gpu_memory_percent=snapshot.system.gpu_memory_percent,
-                    net_recv_rate=snapshot.system.net_recv_rate,
-                    net_send_rate=snapshot.system.net_send_rate,
-                )
+            point = HistoryPoint(
+                timestamp=snapshot.timestamp,
+                cpu_percent=snapshot.system.cpu_percent,
+                ram_percent=snapshot.system.ram_percent,
+                gpu_percent=snapshot.system.gpu_percent,
+                gpu_memory_percent=snapshot.system.gpu_memory_percent,
+                net_recv_rate=snapshot.system.net_recv_rate,
+                net_send_rate=snapshot.system.net_send_rate,
             )
+            self._append_history_point(point, persist=True)
             self._refresh_summary()
             self._refresh_table()
             self._refresh_details()
             self._refresh_trends()
+            await self._watchdog_check()
+
+    def _load_persisted_history(self) -> None:
+        try:
+            self.history.clear()
+            self.history.extend(self.history_store.load(time.time()))
+        except OSError as error:
+            self._report_history_store_error(f"Unable to load chart history: {error}")
+
+    def _append_history_point(self, point: HistoryPoint, *, persist: bool) -> None:
+        self.history.append(point)
+        trimmed = self._trim_history(point.timestamp)
+        if not persist:
+            return
+        try:
+            self.history_store.append(point)
+            if trimmed:
+                self.history_store.replace(self.history)
+            self._history_store_error = None
+        except OSError as error:
+            self._report_history_store_error(f"Unable to store chart history: {error}")
+
+    def _trim_history(self, now: float) -> bool:
+        cutoff = now - HISTORY_WINDOW_MAX
+        trimmed = False
+        while self.history and self.history[0].timestamp < cutoff:
+            self.history.popleft()
+            trimmed = True
+        while len(self.history) > MAX_HISTORY_POINTS:
+            self.history.popleft()
+            trimmed = True
+        return trimmed
+
+    def _report_history_store_error(self, message: str) -> None:
+        if message == self._history_store_error:
+            return
+        self._history_store_error = message
+        self.notify(message, severity="warning")
 
     def _refresh_footer(self) -> None:
         graph_hint = "g table" if self.graph_mode else "g graphs"
         self.query_one("#footer", Static).update(
-            f"Keys: q quit  {graph_hint}  shift+g gpu  d detail  c cpu  m ram-sum  v vram  x stopped  k kill  r restart  +/- zoom"
+            f"Keys: q quit  {graph_hint}  shift+g gpu  d detail  c cpu  m ram-sum  v vram  x stopped  k kill  r restart  +/- zoom  w watchdog  W target"
         )
 
     def _schedule_refresh(self) -> None:
@@ -504,10 +569,16 @@ class DgxTopApp(App):
     def _refresh_summary(self) -> None:
         assert self.snapshot is not None
         system = self.snapshot.system
+        wd_label = self.watchdog_mode.value
+        if self.watchdog_mode == WatchdogMode.MANUAL:
+            wd_label += f"({self.watchdog_container or '?'})"
+        if self.watchdog_mode != WatchdogMode.OFF:
+            wd_label += f" grace:{fmt_bytes(self.watchdog_grace_bytes)}"
         line_one = (
             f"DGX_TOP  refresh:{int(REFRESH_INTERVAL_SECONDS)}s  history:{fmt_history_window(self.history_window)}  "
             f"sort:{self.sort_label()}  show:{'all' if self.show_stopped else 'running'}  "
-            f"docker:{system.running_containers} up / {system.stopped_containers} stopped"
+            f"docker:{system.running_containers} up / {system.stopped_containers} stopped  "
+            f"watchdog:{wd_label}"
         )
         gpu_name = system.gpu_name or "GPU n/a"
         gpu_total = fmt_bytes(system.gpu_memory_total_bytes) if system.gpu_memory_total_bytes > 0 else "--"
@@ -546,10 +617,14 @@ class DgxTopApp(App):
         existing_selection = self.selected_key
 
         table.clear(columns=False)
+        wd_target = self._watchdog_target()
+        wd_target_name = wd_target.name if wd_target is not None else None
         visible_keys: list[str] = []
         for row in rows:
             visible_keys.append(row.key)
             type_cell = Text("D", style="bold green") if row.kind == "docker" else Text("H", style="bold cyan")
+            if row.name == wd_target_name:
+                type_cell.append("w", style="bold orange1")
             name_cell = self._name_cell(row)
             table.add_row(
                 type_cell,
@@ -1001,7 +1076,112 @@ class DgxTopApp(App):
         except Exception as error:
             self.notify(str(error), severity="error")
 
+    # ── Memory watchdog ──────────────────────────────────────────────
+
+    def _watchdog_target(self) -> ContainerInfo | None:
+        """Return the container the watchdog would kill, or None."""
+        if self.watchdog_mode == WatchdogMode.OFF or self.snapshot is None:
+            return None
+        containers = self.snapshot.containers
+        running = {k: c for k, c in containers.items() if c.status == "running"}
+        if not running:
+            return None
+        if self.watchdog_mode == WatchdogMode.MANUAL:
+            if self.watchdog_container is None:
+                return None
+            for c in running.values():
+                if c.name == self.watchdog_container or c.container_id.startswith(self.watchdog_container):
+                    return c
+            return None
+        # BIGGEST mode: container with highest rss_bytes
+        return max(running.values(), key=lambda c: c.rss_bytes)
+
+    async def _watchdog_check(self) -> None:
+        """Kill target container if system RAM headroom is below grace."""
+        if self.watchdog_mode == WatchdogMode.OFF or self.snapshot is None:
+            return
+        system = self.snapshot.system
+        free_bytes = system.ram_total_bytes - system.ram_used_bytes
+        if free_bytes >= self.watchdog_grace_bytes:
+            return
+        # Cooldown: don't kill more than once per 10 seconds
+        now = time.time()
+        if now - self._watchdog_last_kill < 10.0:
+            return
+        target = self._watchdog_target()
+        if target is None:
+            self.notify("Watchdog: no target container found!", severity="warning")
+            return
+        self._watchdog_last_kill = now
+        self.notify(
+            f"WATCHDOG: killing {target.name} (free RAM {fmt_bytes(free_bytes)} < grace {fmt_bytes(self.watchdog_grace_bytes)})",
+            severity="error",
+        )
+        try:
+            message = await asyncio.to_thread(self.collector.kill_container, target.container_id)
+            self.notify(f"Watchdog: {message}", severity="warning")
+        except Exception as error:
+            self.notify(f"Watchdog kill failed: {error}", severity="error")
+
+    def action_cycle_watchdog(self) -> None:
+        modes = list(WatchdogMode)
+        idx = modes.index(self.watchdog_mode)
+        self.watchdog_mode = modes[(idx + 1) % len(modes)]
+        label = self.watchdog_mode.value
+        if self.watchdog_mode == WatchdogMode.MANUAL:
+            label += f" ({self.watchdog_container or 'none'})"
+        self.notify(f"Watchdog: {label}")
+        self._refresh_footer()
+        self._refresh_summary()
+
+    def action_set_watchdog_target(self) -> None:
+        """Set the currently selected container as the watchdog target."""
+        entity = self.current_entity()
+        if not isinstance(entity, ContainerInfo):
+            self.notify("Select a container row first", severity="warning")
+            return
+        self.watchdog_container = entity.name
+        if self.watchdog_mode != WatchdogMode.MANUAL:
+            self.watchdog_mode = WatchdogMode.MANUAL
+        self.notify(f"Watchdog target: {entity.name}")
+        self._refresh_footer()
+        self._refresh_summary()
+
+
+def _parse_grace(value: str) -> int:
+    """Parse a human-friendly byte size like '1G', '512M', '2048'."""
+    value = value.strip().upper()
+    multipliers = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+    if value and value[-1] in multipliers:
+        return int(float(value[:-1]) * multipliers[value[-1]])
+    return int(value)
+
 
 def main() -> None:
-    app = DgxTopApp()
+    parser = argparse.ArgumentParser(description="DGX Top — Docker/GPU monitoring dashboard")
+    parser.add_argument(
+        "--watchdog",
+        choices=["off", "biggest", "manual"],
+        default="off",
+        help="Memory watchdog mode: off (default), biggest (kill largest container), manual (kill selected container)",
+    )
+    parser.add_argument(
+        "--watchdog-grace",
+        default="1G",
+        metavar="SIZE",
+        help="Free RAM threshold before watchdog kills (default: 1G). Supports K/M/G/T suffixes.",
+    )
+    parser.add_argument(
+        "--watchdog-container",
+        default=None,
+        metavar="NAME",
+        help="Container name or ID prefix for manual watchdog mode",
+    )
+    args = parser.parse_args()
+
+    app = DgxTopApp(
+        watchdog_mode=WatchdogMode(args.watchdog),
+        watchdog_grace_bytes=_parse_grace(args.watchdog_grace),
+        watchdog_container=args.watchdog_container,
+    )
     app.run()

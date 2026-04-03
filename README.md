@@ -16,6 +16,7 @@ It combines:
 - Compact two-line host summary at the top
 - Separate CPU, GPU, RAM sum, RSS, cgroup memory, and GPU memory columns
 - Lower-third two-line trend graphs for CPU, GPU, RAM, VRAM, and host network up/down
+- Persistent trend history across restarts, stored as JSONL under `~/.local/state/dgxtop/history.jsonl` by default
 - Optional detail pane with commands, ports, memory split, and inner processes
 - Best-effort per-container network throughput in the detail pane for running Docker containers
 - Optional per-process `ebpf` traffic in the detail pane when the dashboard runs with root privileges; otherwise it falls back to namespace traffic
@@ -90,6 +91,7 @@ dgx-top
 - Per-process GPU load is best-effort and depends on `nvidia-smi pmon`.
 - Per-process `ebpf` network traffic requires running the dashboard with privileges that allow `bpftrace`; unprivileged runs fall back to network-namespace traffic.
 - The root `dgx_top.py` file is a thin source launcher. The package entry point is `dgxtop`.
+- Set `DGX_TOP_HISTORY_FILE` to override the history file location.
 
 ## Documentation
 
