@@ -83,6 +83,43 @@ dgx-top
 - `r`: restart selected container
 - `+`: double the visible trend history window
 - `-`: halve the visible trend history window
+- `w`: cycle watchdog mode (off → biggest → manual)
+- `W`: set the selected container as the manual watchdog target
+
+## Watchdog
+
+The watchdog automatically kills a container when free system RAM drops below a configurable grace threshold, protecting the host from OOM conditions.
+
+Three modes are available:
+
+| Mode | Behaviour |
+|------|-----------|
+| `off` | Watchdog disabled (default) |
+| `biggest` | Kills the running container with the highest RSS |
+| `manual` | Kills the container explicitly selected with `W` |
+
+Cycle modes with `w`. A 10-second kill cooldown prevents rapid re-triggers.
+
+### CLI flags
+
+```
+--watchdog {off,biggest,manual}   Watchdog mode (default: off)
+--watchdog-grace SIZE              Free-RAM threshold that triggers a kill,
+                                   e.g. 2G, 512M (default: 1G)
+```
+
+### Example
+
+```bash
+dgx-top --watchdog biggest --watchdog-grace 2G
+```
+
+## History
+
+Trend data (CPU, RAM, GPU, VRAM, network rates) is persisted to a JSONL file so graphs survive restarts. On load, points older than the configured maximum age are automatically pruned and the file is compacted.
+
+Default path: `~/.local/state/dgxtop/history.jsonl`  
+Override: `DGX_TOP_HISTORY_FILE=/path/to/file dgx-top`
 
 ## Notes
 

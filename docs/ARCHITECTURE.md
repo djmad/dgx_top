@@ -21,22 +21,40 @@
 - `DashboardSnapshot`
 - `HistoryPoint`
 
-## 3. Textual UI
+## 3. History Store
+
+[`dgxtop/history_store.py`](../dgxtop/history_store.py) persists trend data across restarts:
+- Appends `HistoryPoint` records as newline-delimited JSON (JSONL) to `~/.local/state/dgxtop/history.jsonl` (overridable via `DGX_TOP_HISTORY_FILE`)
+- On load, prunes records older than the configured maximum age and enforces a maximum point count; rewrites the file in place when compaction is needed
+- Handles corrupt or missing lines gracefully
+
+## 4. Textual UI
 
 [`dgxtop/app.py`](../dgxtop/app.py) renders the dashboard:
-- two-line host summary
-- unified main table
-- optional detail pane
-- lower-third trend panel
-- confirmation screens for destructive actions
+- Two-line host summary including active watchdog state
+- Unified main table with the watchdog target highlighted
+- Optional detail pane
+- Lower-third trend panel (zoomable with `+`/`-`, full-screen with `g`)
+- Confirmation screens for destructive actions
+- Watchdog engine that kills a container when free RAM falls below the grace threshold
 
 ## Data Flow
 
-1. The UI schedules periodic refreshes.
+1. The UI schedules periodic refreshes via a lock-guarded async worker.
 2. `DashboardCollector.sample()` builds a `DashboardSnapshot`.
-3. The app sorts and renders rows based on the active field.
-4. History points are stored for CPU, RAM, GPU, VRAM, and host network rates, then persisted to a local JSONL history file.
-5. The trend panel compresses the visible window to the current terminal width.
+3. The app sorts and renders rows based on the active sort field.
+4. Each refresh appends a `HistoryPoint` to `HistoryStore`; the store handles persistence and compaction.
+5. The trend panel compresses the in-memory history window to the current terminal width.
+6. After rendering, `_watchdog_check()` compares free RAM against the grace threshold and kills the target container if needed (10-second cooldown).
+
+## Watchdog
+
+The watchdog runs inside the UI refresh loop. Two modes are supported:
+
+- **biggest**: automatically targets the running container with the highest RSS
+- **manual**: targets a user-selected container (set with `W`, cycled with `w`)
+
+CLI flags `--watchdog` and `--watchdog-grace` configure the initial mode and grace threshold.
 
 ## Packaging
 
